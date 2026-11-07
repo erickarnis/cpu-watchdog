@@ -72,7 +72,9 @@ proc_desc() {  # short human description: name plus a hint of its args
   local name=${${args%% *}:t}
   local rest=${args#* }; [[ $rest == $args ]] && rest=""
   # drop path noise from the first argument (e.g. node_modules/astro/bin/astro.mjs → astro.mjs)
-  rest=$(print -r -- "$rest" | awk '{ n=split($1,p,"/"); $1=p[n]; print }' | cut -c1-40)
+  rest=$(print -r -- "$rest" | awk '{ n=split($1,p,"/"); $1=p[n]; print }')
+  # shorten to ~40 chars at a word boundary
+  if (( ${#rest} > 40 )); then rest=${rest[1,40]}; rest="${rest% *}…"; fi
   print -r -- "$name${rest:+ ($rest)}"
 }
 
