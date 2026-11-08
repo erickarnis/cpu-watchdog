@@ -53,14 +53,14 @@ banner() {  # title message
 
 # --- one snapshot of every process ---------------------------------------------
 # key = pid:start-time, so a reused PID is never mistaken for the old process.
-typeset -A KEY PPID_OF UID_OF CPU_S ETIME COMM
+typeset -A KEY PPID_OF UID_OF CPU_S ETIME COMM EXE
 snapshot() {
-  KEY=() PPID_OF=() UID_OF=() CPU_S=() ETIME=() COMM=()
+  KEY=() PPID_OF=() UID_OF=() CPU_S=() ETIME=() COMM=() EXE=()
   local pid ppid uid t etime w d mo y hms comm m s
   LC_ALL=C ps -Ao pid=,ppid=,uid=,time=,etime=,lstart=,comm= 2>/dev/null |
   while read -r pid ppid uid t etime w mo d hms y comm; do
     KEY[$pid]="$pid:$mo$d-$hms-$y"; PPID_OF[$pid]=$ppid; UID_OF[$pid]=$uid
-    ETIME[$pid]=$etime; COMM[$pid]=${comm:t}
+    ETIME[$pid]=$etime; COMM[$pid]=${comm:t}; EXE[$pid]=$comm   # full path (may contain spaces)
     # cumulative CPU time: [[dd-]hh:]mm:ss.cc  (macOS prints mmm:ss.cc)
     d=0; [[ $t == *-* ]] && { d=${t%%-*}; t=${t#*-}; }
     m=(${(s.:.)t}); s=${m[-1]}; m[-1]=()
@@ -77,8 +77,9 @@ fmt_age() { (( $1 >= 24 )) && REPLY="$(( $1 / 24 ))d $(( $1 % 24 ))h" || REPLY="
 args_of() { ps -o args= -p $1 2>/dev/null; }
 cwd_of()  { lsof -a -p $1 -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1; }
 desc_of() {  # short description: name plus a hint of its args
-  local args=$(args_of $1) rest; [[ -z $args ]] && return 1
-  rest=${args#* }; [[ $rest == $args ]] && rest=""
+  local args=$(args_of $1) rest exe=${EXE[$1]}; [[ -z $args ]] && return 1
+  if [[ $args == $exe* ]]; then rest=${${args#$exe}# }   # path may contain spaces
+  else rest=${args#* }; [[ $rest == $args ]] && rest=""; fi
   local first=${rest%% *}  # node_modules/astro/bin/astro.mjs dev → astro.mjs dev
   rest=${first:t}${rest#$first}
   (( ${#rest} > 40 )) && rest="${${rest[1,40]}% *}…"
@@ -141,7 +142,15 @@ for pid key in ${(kv)KEY}; do
     d="$pct% CPU for $dur · PID $pid"
     # every daemon's parent is launchd; only call dev tools "orphaned"
     [[ ${PPID_OF[$pid]} == 1 && ${COMM[$pid]} =~ $DEV_BIN_RE ]] && d+=" · orphaned"
-    add_finding $pid c "Runaway process: $REPLY" "$d"
+    if [[ ${PPID_OF[$pid]} == 1 && ${EXE[$pid]} == (/System/Library/*|/usr/libexec/*|/usr/sbin/*|/sbin/*) \
+          && ! ${COMM[$pid]} =~ '^(loginwindow|launchd|WindowServer|kernel_task)$' ]]; then
+      # macOS services look "intended", but sustained load like this usually means
+      # one is stuck. launchd relaunches them, so a restart is safe.
+      add_finding $pid c "Stuck macOS service: $REPLY" \
+        "$d"$'\n'"Not normal for this long. Restarting it is safe: macOS relaunches it."
+    else
+      add_finding $pid c "Runaway process: $REPLY" "$d"
+    fi
   fi
   # 2. orphaned dev server
   if [[ ${PPID_OF[$pid]} == 1 && ${COMM[$pid]} =~ $DEV_BIN_RE ]]; then
@@ -157,15 +166,21 @@ done
 typeset -A out_flags out_alert
 for k f in ${(kv)flags}; do out_flags[$k]=$f; out_alert[$k]=${last_alert[$k]}; done
 
+add_info() {  # index text → append " · text" to the first line of a finding's detail
+  local d=${f_detail[$1]} nl=$'\n'
+  if [[ $d == *$nl* ]]; then f_detail[$1]="${d%%$nl*} · $2$nl${d#*$nl}"; else f_detail[$1]="$d · $2"; fi
+}
+
 if (( $#f_pid && ! away )); then
   mine=() theirs=() tilde='~'
   for i in {1..$#f_pid}; do
     p=$f_pid[i]; k=$KEY[$p]
     out_flags[$k]=${${out_flags[$k]:#-}//$f_flag[i]/}$f_flag[i]; out_alert[$k]=$now
     if [[ ${UID_OF[$p]} == $UID ]]; then
-      mine+=$p; c=$(cwd_of $p); [[ -n $c ]] && f_detail[i]+=" · ${c/#$HOME/$tilde}"
+      mine+=$p; c=$(cwd_of $p)
+      [[ -n $c && $c != / ]] && add_info $i "${c/#$HOME/$tilde}"   # "/" tells you nothing
     else
-      theirs+=$p; f_detail[i]+=" · owned by $(id -un ${UID_OF[$p]} 2>/dev/null || print uid ${UID_OF[$p]}) (needs sudo)"
+      theirs+=$p; add_info $i "owned by $(id -un ${UID_OF[$p]} 2>/dev/null || print uid ${UID_OF[$p]}) (needs sudo)"
     fi
     log "$f_title[i] — $f_detail[i]"
   done
@@ -174,7 +189,7 @@ if (( $#f_pid && ! away )); then
     title=$f_title[1]; msg=$f_detail[1]; killbtn="Kill"
   else
     title="$#f_pid processes need attention"; msg=""
-    for i in {1..$(( $#f_pid < 6 ? $#f_pid : 6 ))}; do msg+="• ${f_title[i]#*: } — ${f_detail[i]}"$'\n\n'; done
+    for i in {1..$(( $#f_pid < 6 ? $#f_pid : 6 ))}; do msg+="• ${f_title[i]#Runaway process: } — ${f_detail[i]}"$'\n\n'; done
     (( $#f_pid > 6 )) && msg+="…and $(( $#f_pid - 6 )) more (see watchdog.log)"
     msg=${msg%$'\n\n'}; killbtn="Kill all"
   fi

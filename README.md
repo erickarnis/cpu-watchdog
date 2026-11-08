@@ -8,7 +8,10 @@ CPU, or when a dev server outlives the terminal, editor or AI agent that started
 Every 5 minutes it flags:
 
 - **Runaway processes**: averaging over 80% CPU for 15 minutes. This is the true
-  average from cumulative CPU time, not a snapshot.
+  average from cumulative CPU time, not a snapshot. macOS services (for
+  example `PerfPowerServices`) are labelled **Stuck macOS service**, because
+  hours of load from one usually means it's stuck, not working as intended.
+  Restarting one is safe: launchd relaunches it.
 - **Forgotten dev servers**: `node`, `bun`, `deno`, `python`, `ruby`, `php` or
   `hugo` running a dev/serve/watch command (Vite, Astro, Next, uvicorn,
   runserver, `--reload`, …) with no parent process for 6+ hours.
