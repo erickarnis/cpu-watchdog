@@ -4,7 +4,9 @@
 # Alerts (Ignore / Copy kill command / Kill — nothing is killed unless you click
 # Kill) when:
 #   1. a process averages more than CPU_THRESHOLD % CPU over STRIKES consecutive
-#      checks (measured from cumulative CPU time, so it's a true average)
+#      checks (measured from cumulative CPU time, so it's a true average). If it
+#      is still reading/writing disk or network it's probably busy, not stuck,
+#      so it gets BUSY_STRIKES checks instead.
 #   2. a dev server (node/bun/deno/python… running dev/serve/watch) has had no
 #      parent process (reparented to launchd) for more than ORPHAN_HOURS
 #
@@ -15,13 +17,15 @@ zmodload zsh/datetime
 
 # --- settings ------------------------------------------------------------------
 typeset -A _env
-for _v in CPU_THRESHOLD STRIKES ORPHAN_HOURS REALERT_HOURS IDLE_MINUTES ALERT_TIMEOUT \
+for _v in CPU_THRESHOLD STRIKES BUSY_STRIKES IO_MIN_MB ORPHAN_HOURS REALERT_HOURS IDLE_MINUTES ALERT_TIMEOUT \
           INTERVAL STATE_DIR IGNORE_RE IGNORE_ARGS_RE DEV_BIN_RE DEV_ARGS_RE; do
   [[ -n ${(P)_v} ]] && _env[$_v]=${(P)_v}
 done
 
 CPU_THRESHOLD=80     # % of one core, averaged over a check interval (can exceed 100)
 STRIKES=3            # consecutive high intervals before alerting (3 × 5 min = 15 min)
+BUSY_STRIKES=12      # same, for a process still doing disk/network I/O (12 × 5 min = 1 h)
+IO_MIN_MB=5          # less disk + network I/O than this while at high CPU = likely stuck
 ORPHAN_HOURS=6       # how long an orphaned dev server may run
 REALERT_HOURS=2      # alert again if still a problem this long after an alert (0 = never)
 IDLE_MINUTES=2       # hold alerts while you've been away from the keyboard this long
@@ -95,13 +99,13 @@ tree_of() {  # pid and all its descendants (current snapshot), children last
 }
 
 # --- previous state ---------------------------------------------------------------
-# line 1: "ts <epoch>"; then: key cpu_seconds strikes flags last_alert_epoch
-typeset -A prev_cpu strikes flags last_alert
+# line 1: "ts <epoch>"; then: key cpu_seconds strikes flags last_alert_epoch io_bytes (disk+network, only while it has strikes)
+typeset -A prev_cpu strikes flags last_alert io0
 prev_ts=0
 if [[ -r $STATE ]]; then
-  while read -r k c n f a; do
+  while read -r k c n f a i; do
     if [[ $k == ts ]]; then prev_ts=$c; continue; fi
-    prev_cpu[$k]=$c; strikes[$k]=$n; flags[$k]=$f; last_alert[$k]=$a
+    prev_cpu[$k]=$c; strikes[$k]=$n; flags[$k]=$f; last_alert[$k]=$a; io0[$k]=${i:--}
   done < "$STATE"
 fi
 elapsed=$(( now_f - prev_ts ))
@@ -116,6 +120,30 @@ for pid key in ${(kv)KEY}; do
   [[ ${COMM[$pid]} =~ $IGNORE_RE ]] && continue
   new_strikes[$key]=$(( ${strikes[$key]:-0} + 1 ))
 done
+
+# --- progress: is a high-CPU process still doing disk or network I/O? -------------
+# Busy work (export, sync, build) moves data; a stuck loop doesn't. Only measured
+# for processes with strikes: one JXA call (proc_pid_rusage) + one nettop sample.
+typeset -A IO NET
+io_pids=(); for pid key in ${(kv)KEY}; do (( ${new_strikes[$key]:-0} )) && io_pids+=$pid; done
+if (( $#io_pids )); then
+  osascript -l JavaScript -e '
+    ObjC.import("Foundation");
+    ObjC.bindFunction("proc_pid_rusage", ["int", ["int", "int", "void *"]]);
+    function u64(s, o) { let v = 0; for (let i = 7; i >= 0; i--) v = v * 256 + s.charCodeAt(o + i); return v; }
+    function run(argv) { return argv.map(a => {
+      const d = $.NSMutableData.dataWithLength(256);   // rusage_info_v2
+      if ($.proc_pid_rusage(parseInt(a), 2, d.mutableBytes) !== 0) return a + " -";
+      const s = $.NSString.alloc.initWithDataEncoding(d, $.NSISOLatin1StringEncoding).js;
+      return a + " " + (u64(s, 144) + u64(s, 152));     // ri_diskio_bytesread + byteswritten
+    }).join("\n"); }' $io_pids 2>/dev/null |
+  while read -r p b; do [[ $b == <-> ]] && IO[$p]=$b; done   # other users' processes: unknown
+  nettop -P -L 1 -x -J bytes_in,bytes_out 2>/dev/null |
+    awk -F, 'NR > 1 { n = $0; sub(/,[0-9]+,[0-9]+,$/, "", n); sub(/.*\./, "", n); print n, $(NF-2) + $(NF-1) }' |
+  while read -r p b; do NET[$p]=$b; done
+  for p in ${(k)IO}; do (( IO[$p] += ${NET[$p]:-0} )); done
+fi
+fmt_bytes() { (( $1 >= 1073741824 )) && REPLY="$(( $1 * 10 / 1073741824 / 10.0 )) GB" || REPLY="$(( $1 / 1048576 )) MB"; }
 
 # --- decide what to report ------------------------------------------------------
 idle=$(ioreg -c IOHIDSystem -d 4 -r -k HIDIdleTime 2>/dev/null | awk '/HIDIdleTime/{print int($NF/1e9); exit}')
@@ -135,7 +163,18 @@ add_finding() {  # pid flag title detail
 for pid key in ${(kv)KEY}; do
   # 1. sustained high CPU
   n=${new_strikes[$key]:-0}
-  if (( n >= STRIKES )) && due $key c; then
+  verdict="" busy=0
+  if (( n >= STRIKES )) && [[ -n ${IO[$pid]} && ${io0[$key]:--} == <-> ]]; then
+    moved=$(( IO[$pid] - io0[$key] )); w=${elapsed%.*}   # over the last interval only
+    (( w >= 60 )) && w="the last $(( w / 60 )) min" || w="the last $w s"
+    if (( moved < IO_MIN_MB * 1048576 )); then
+      verdict="Likely stuck: no disk or network activity in $w."
+    else
+      busy=1; fmt_bytes $moved
+      verdict="Likely busy, not stuck: moved $REPLY of disk and network data in $w."
+    fi
+  fi
+  if (( n >= (busy ? BUSY_STRIKES : STRIKES) )) && due $key c; then
     desc_of $pid || continue
     pct=$(( (CPU_S[$pid] - prev_cpu[$key]) * 100.0 / elapsed )); pct=${pct%.*}
     dur=$(( n * INTERVAL )); (( dur >= 60 )) && dur="$(( dur / 60 ))+ min" || dur="${dur}+ s"
@@ -147,9 +186,9 @@ for pid key in ${(kv)KEY}; do
       # macOS services look "intended", but sustained load like this usually means
       # one is stuck. launchd relaunches them, so a restart is safe.
       add_finding $pid c "Stuck macOS service: $REPLY" \
-        "$d"$'\n'"Not normal for this long. Restarting it is safe: macOS relaunches it."
+        "$d"$'\n'"Not normal for this long. Restarting it is safe: macOS relaunches it."${verdict:+$'\n'$verdict}
     else
-      add_finding $pid c "Runaway process: $REPLY" "$d"
+      add_finding $pid c "Runaway process: $REPLY" "$d"${verdict:+$'\n'$verdict}
     fi
   fi
   # 2. orphaned dev server
@@ -250,7 +289,7 @@ fi
 {
   print -r -- "ts $now_f"
   for pid key in ${(kv)KEY}; do
-    printf '%s %.2f %d %s %d\n' $key ${CPU_S[$pid]} ${new_strikes[$key]:-0} ${out_flags[$key]:--} ${out_alert[$key]:-0}
+    printf '%s %.2f %d %s %d %s\n' $key ${CPU_S[$pid]} ${new_strikes[$key]:-0} ${out_flags[$key]:--} ${out_alert[$key]:-0} ${IO[$pid]:--}
   done
 } > "$STATE.tmp.$$" && mv -f "$STATE.tmp.$$" "$STATE"
 

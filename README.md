@@ -8,7 +8,10 @@ CPU, or when a dev server outlives the terminal, editor or AI agent that started
 Every 5 minutes it flags:
 
 - **Runaway processes**: averaging over 80% CPU for 15 minutes. This is the true
-  average from cumulative CPU time, not a snapshot. macOS services (for
+  average from cumulative CPU time, not a snapshot. The alert says whether it's
+  **likely stuck** (no disk or network activity in the last 5 minutes) or
+  **likely busy** (still moving data, as during an export, sync or build). A busy
+  process gets an hour before you're alerted. macOS services (for
   example `PerfPowerServices`) are labelled **Stuck macOS service**, because
   hours of load from one usually means it's stuck, not working as intended.
   Restarting one is safe: launchd relaunches it.
